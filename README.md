@@ -1,11 +1,10 @@
 <p align="center">
-  <img src="docs/source/_static/text_logo.png" width="200" alt="DeepSpatial">
+  <img src="assets/logo.png" width="200" alt="DeepSpatial">
 </p>
 
 <p align="center">
   <a href="https://pypi.org/project/deepspatial/"><img src="https://img.shields.io/badge/Pypi-1.0.0-317EC2.svg" alt="PyPI"></a>
   <a href="https://yyh030806.github.io/DeepSpatial/"><img src="https://img.shields.io/badge/Homepage-deepspatial-f773a8.svg" alt="Homepage"></a>
-  <a href="https://yyh030806.github.io/DeepSpatial/docs/"><img src="https://img.shields.io/badge/Documentation-latest-4CAF50.svg" alt="Docs"></a>
   <a href="https://doi.org/10.64898/2026.04.28.721395"><img src="https://img.shields.io/badge/Paper-bioRxiv-00AAB5.svg" alt="BioRxiv"></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-FF9800.svg" alt="License"></a>
 </p>
@@ -70,9 +69,8 @@ adata_3d = model.reconstruct_full_volume(adatas, thickness=10.0)
 
 ## Resources
 
-- Documentation, tutorials, and API reference: https://yyh030806.github.io/DeepSpatial/docs/
 - Homepage: https://yyh030806.github.io/DeepSpatial/
-- Bug reports and feature requests: https://github.com/yyh030806/DeepSpatial/issues
+- Bug reports and feature requests: https://github.com/hurricanelittlebun/DeepSpatial_v2/issues
 
 ## Citation
 
@@ -169,12 +167,9 @@ Use `--no-celltype` only for an explicit no-celltype ablation. The morphology
 path mode requires a persistent path cache; the training loop does not read WSI
 files or run UNI2 repeatedly.
 
-- [Implementation, input schema and three modes](docs/morphology.md)
-- [Executed validation and limitations](docs/morphology-validation.md)
-- [Repository layout and release boundary](docs/repository-layout.md)
 - [Training entry point](examples/morphology_train.py)
 
-This is a tested prototype, not a real-tissue validation result. No registration
+This is a validated prototype, not a real-tissue validation result. No registration
 is performed. For large anchor slices, use `setup_data(uot_solver="sparse_topk",
 uot_top_k=64)`; the original dense UOT remains available as a small-scale
 reference and still requires explicit size control.

@@ -46,25 +46,15 @@ dependencies = [
 
 [project.optional-dependencies]
 histology = ["h5py>=3.8", "Pillow>=9.1", "timm>=0.9.8", "huggingface-hub", "openslide-python"]
-test = ["pytest>=7"]
-docs = [
-    "mkdocs-material",
-    "mkdocs-jupyter",
-    "mkdocstrings[python]",
-]
 
 [project.urls]
 "Homepage" = "https://yyh030806.github.io/DeepSpatial/"
-"Documentation" = "https://yyh030806.github.io/DeepSpatial/docs/"
-"Repository" = "https://github.com/yyh030806/DeepSpatial"
-"Bug Tracker" = "https://github.com/yyh030806/DeepSpatial/issues"
+"Repository" = "https://github.com/hurricanelittlebun/DeepSpatial_v2"
+"Bug Tracker" = "https://github.com/hurricanelittlebun/DeepSpatial_v2/issues"
 
 [tool.setuptools]
 include-package-data = true
 
 [tool.setuptools.packages.find]
 include = ["deepspatial*"]
-exclude = ["docs*", "tests*", "index*"]
-
-[tool.setuptools.data-files]
-"deepspatial" = ["docs/source/_static/text_logo.png"]
+exclude = ["index*"]

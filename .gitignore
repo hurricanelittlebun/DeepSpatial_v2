@@ -6,6 +6,12 @@ __pycache__/
 artifacts/
 weights/
 data/
+# Local-only research material; the minimal public repository does not track
+# these directories, but keep them available in the working copy.
+docs/
+tests/
+scripts/
+.github/workflows/docs-pages.yml
 dist/
 build/
 *.h5ad

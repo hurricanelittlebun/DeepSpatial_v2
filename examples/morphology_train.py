@@ -1,4 +1,4 @@
-"""Train one independent tissue/g series. See docs/morphology.md for schema."""
+"""Train one independent tissue/g series. See README.md for usage and schema."""
 
 import argparse
 import anndata as ad
