@@ -35,8 +35,8 @@ pip install deepspatial
 From source (development):
 
 ```bash
-git clone https://github.com/yyh030806/DeepSpatial.git
-cd DeepSpatial
+git clone https://github.com/hurricanelittlebun/DeepSpatial_v2.git
+cd DeepSpatial_v2
 pip install -e .
 ```
 
@@ -95,6 +95,79 @@ correspondence paths are available as optional components. H&E constrains
 endpoint correspondence and spatial paths; it is not a direct gene-expression
 regressor or a separate spatial velocity head. The original cell-type
 architecture and histology-off mode remain.
+
+### What is improved in v2
+
+Compared with the original DeepSpatial implementation, this version adds:
+
+- Frozen UNI2-H morphology embeddings extracted offline from registered H&E
+  patches in a common physical coordinate system.
+- A morphology-aware UOT cost that combines spatial, gene, cell-type, and H&E
+  morphology distances.
+- A cached morphology-guided spatial path through intermediate H&E sections,
+  using local candidate search and layered dynamic programming rather than a
+  straight-line spatial interpolation.
+- A sparse top-k UOT backend for large anchor slices, while retaining dense UOT
+  as the small-scale reference implementation.
+- Optional nucleus-supported paths and preservation of the original cell-type
+  branch, including `use_celltype=True/False` ablation support.
+
+H&E is deliberately not passed directly into the gene or cell-type velocity
+heads. This keeps the extension focused on morphology-guided spatial transport
+instead of turning it into an H&E-to-gene-expression regression model.
+
+### How to call the v2 pipeline
+
+Each independently registered tissue/g series is passed as an ordered list of
+AnnData anchors. The anchors must share the same `.var_names`, use physical
+micrometre coordinates in `.obsm['spatial_registered']`, and provide one
+physical Z value in `.obs['z_um']` per section.
+
+For the original DeepSpatial baseline:
+
+```python
+from deepspatial import DeepSpatial
+
+model = DeepSpatial()
+model.setup_data(anchors, spatial_key="spatial_registered", z_key="z_um",
+                 label_key="cell_class", use_celltype=True)
+model.build_model()
+model.fit(max_epochs=100, save_dir="artifacts/model")
+volume = model.reconstruct_full_volume(anchors, thickness=10.0)
+volume.write_h5ad("artifacts/virtual_st.h5ad")
+```
+
+For morphology-aware UOT/path, first extract the frozen UNI2 feature store
+from an already registered H&E manifest:
+
+```bash
+python -m deepspatial.histology.extract manifest.json artifacts/uni2.h5 \
+  --checkpoint /path/to/UNI2/pytorch_model.bin \
+  --device cuda:0 --batch-size 32
+```
+
+Then use the unified example entry point:
+
+```bash
+# Original baseline, no H&E
+python -m examples.morphology_train anchor11.h5ad anchor21.h5ad \
+  --mode baseline
+
+# H&E morphology-aware UOT
+python -m examples.morphology_train anchor11.h5ad anchor21.h5ad \
+  --mode uot --features artifacts/uni2.h5 \
+  --frame 00029_g0_registered
+
+# H&E morphology-guided UOT + cached spatial path
+python -m examples.morphology_train anchor11.h5ad anchor21.h5ad \
+  --mode path --features artifacts/uni2.h5 \
+  --paths artifacts/paths.h5 --frame 00029_g0_registered \
+  --uot-solver sparse_topk --uot-top-k 64
+```
+
+Use `--no-celltype` only for an explicit no-celltype ablation. The morphology
+path mode requires a persistent path cache; the training loop does not read WSI
+files or run UNI2 repeatedly.
 
 - [Implementation, input schema and three modes](docs/morphology.md)
 - [Executed validation and limitations](docs/morphology-validation.md)
