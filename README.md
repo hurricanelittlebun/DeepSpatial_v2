@@ -88,6 +88,24 @@ If you use DeepSpatial in your research, please cite:
 }
 ```
 
+## Experimental morphology-aware extension
+
+Frozen UNI2 preprocessing, morphology-aware UOT, and cached anatomical
+correspondence paths are available as optional components. H&E constrains
+endpoint correspondence and spatial paths; it is not a direct gene-expression
+regressor or a separate spatial velocity head. The original cell-type
+architecture and histology-off mode remain.
+
+- [Implementation, input schema and three modes](docs/morphology.md)
+- [Executed validation and limitations](docs/morphology-validation.md)
+- [Repository layout and release boundary](docs/repository-layout.md)
+- [Training entry point](examples/morphology_train.py)
+
+This is a tested prototype, not a real-tissue validation result. No registration
+is performed. For large anchor slices, use `setup_data(uot_solver="sparse_topk",
+uot_top_k=64)`; the original dense UOT remains available as a small-scale
+reference and still requires explicit size control.
+
 ## License
 
 DeepSpatial is released under the MIT License.

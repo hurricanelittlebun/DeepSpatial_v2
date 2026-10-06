@@ -45,6 +45,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+histology = ["h5py>=3.8", "Pillow>=9.1", "timm>=0.9.8", "huggingface-hub", "openslide-python"]
+test = ["pytest>=7"]
 docs = [
     "mkdocs-material",
     "mkdocs-jupyter",

@@ -190,7 +190,8 @@ class GiT(nn.Module):
             h = block(h, cond)
 
         # Project back to modality-specific outputs
-        x = self.x_head(h[:, :1, :], cond).squeeze(1) # [B, 2]
+        hx=h[:, :1, :]
+        x = self.x_head(hx, cond).squeeze(1) # [B, 2]; no HE input to g/c
         g = self.g_head(h[:, 1:, :], cond).reshape(xt.shape[0], -1)[:, :gene_dim] # [B, Gene_Dim]
         c = self.c_head(h.mean(dim=1)) # [B, Classes]
 

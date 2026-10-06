@@ -397,7 +397,8 @@ class Sampler:
         atol=1e-6,
         rtol=1e-3,
         reverse=False,
-        t_forward=None
+        t_forward=None,
+        options=None,
     ):
         """returns a sampling function with given ODE settings
         Args:
@@ -431,6 +432,7 @@ class Sampler:
             num_steps=num_steps,
             atol=atol,
             rtol=rtol,
+            options=options,
         )
         
         return _ode.sample

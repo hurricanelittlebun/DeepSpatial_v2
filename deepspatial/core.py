@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import anndata as ad
 import scipy.sparse
+from scipy.spatial import cKDTree
 import pytorch_lightning as pl
 from tqdm import tqdm
 from torch.utils.data import DataLoader
@@ -13,6 +14,9 @@ from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from .data_utils import DeepSpatialDataset
 from .models import GiT
 from .module import DeepSpatialModule
+
+
+DEFAULT_PROPAGATED_LABEL_KEYS = ("pred_domain", "pred_niche")
 
 
 class DeepSpatial:
@@ -30,6 +34,7 @@ class DeepSpatial:
         
         # Model and Training state
         self.gene_dim = None
+        self.gene_names = None
         self.num_classes = None
         self.model = None
         self.module = None
@@ -40,10 +45,23 @@ class DeepSpatial:
         self.spatial_key = None
         self.z_key = None
         self.label_key = None
+        # These labels are categorical metadata, not model state.  When they
+        # are present on both anchors, reconstruction copies them from the
+        # branch source (adata0 for forward, adata1 for backward).
+        self.propagated_label_keys = ()
         
         # Configuration dictionaries
         self.model_config = {}
         self.train_config = {}
+        self.histology_config = None
+        self.histology_runtime = None
+        self.use_celltype = True
+        self.uot_config = {
+            'solver': 'dense',
+            'top_k': None,
+            'bidirectional': True,
+            'candidate_radius': None,
+        }
 
     def _normalize_spatial(self, adata_list: list[ad.AnnData]) -> None:
         """
@@ -80,6 +98,7 @@ class DeepSpatial:
         # Perform non-destructive normalization
         for i, adata in enumerate(adata_list):
             coords = adata.obsm[self.spatial_key].copy()
+            if not np.issubdtype(coords.dtype,np.floating): coords=coords.astype(float)
             coords[:, 0] = (coords[:, 0] - self.spatial_stats['x_min']) / self.spatial_stats['x_range']
             coords[:, 1] = (coords[:, 1] - self.spatial_stats['y_min']) / self.spatial_stats['y_range']
             
@@ -97,7 +116,11 @@ class DeepSpatial:
                    alpha_spatial: float = 0.5,
                    uot_reg: float = 0.8,
                    uot_tau: float = 0.05,
-                   mode: str = 'fit'):
+                   uot_solver: str = 'dense',
+                   uot_top_k: int | None = None,
+                   uot_bidirectional: bool = True,
+                   uot_candidate_radius: float | None = None,
+                   mode: str = 'fit', use_celltype: bool = True, histology=None):
         """
         Prepares the data pipeline and calculates physical normalization statistics.
         
@@ -112,13 +135,47 @@ class DeepSpatial:
             alpha_spatial: UOT spatial distance weight.
             uot_reg: Entropy regularization for UOT.
             uot_tau: Marginal relaxation for UOT.
+            uot_solver: 'dense' or 'sparse_topk' UOT backend.
+            uot_top_k: Number of spatial candidates for sparse UOT.
+            uot_bidirectional: Include reverse spatial kNN candidates.
+            uot_candidate_radius: Optional candidate radius in solver coordinates.
             mode: Dataset mode ('fit' for training, 'predict' for inference).
         """
         self.spatial_key = spatial_key
         self.z_key = z_key
         self.label_key = label_key
+        self.use_celltype=use_celltype
+        self.uot_config = {
+            'solver': uot_solver,
+            'top_k': uot_top_k,
+            'bidirectional': uot_bidirectional,
+            'candidate_radius': uot_candidate_radius,
+        }
+        from .histology.config import HistologyConfig
+        self.histology_config=histology if isinstance(histology,HistologyConfig) else HistologyConfig(**(histology or {}))
+        if self.histology_config.use_histology:
+            pl.seed_everything(self.histology_config.seed,workers=True)
+        if len(adata_list)<2 or any(a.n_obs==0 for a in adata_list):
+            raise ValueError('At least two nonempty anchor slices required')
+        if any(not a.var_names.equals(adata_list[0].var_names) for a in adata_list):
+            raise ValueError('Anchor gene identities/order must agree; align var_names first')
+        self._resolve_propagated_label_keys_for_anchors(adata_list)
+        self.gene_names=adata_list[0].var_names.tolist()
+        if self.histology_config.use_histology:
+            zs=[]
+            for a in adata_list:
+                z=np.asarray(a.obs[z_key],float)
+                if not np.isfinite(z).all() or not np.all(z==z[0]): raise ValueError('One finite physical Z per anchor required')
+                if not np.isfinite(a.obsm[spatial_key]).all(): raise ValueError('Invalid physical XY')
+                zs.append(z[0])
+            if not np.all(np.diff(zs)>0): raise ValueError('Sort anchors by increasing physical Z')
         
         self._normalize_spatial(adata_list)
+        self.histology_runtime=None
+        if self.histology_config.use_histology:
+            from .histology.runtime import HistologyRuntime
+            self.histology_runtime=HistologyRuntime(self.histology_config,self.spatial_stats)
+            for a in adata_list: self.histology_runtime.section(a)
         
         self.dataset = DeepSpatialDataset(
             adata_list=adata_list, 
@@ -129,10 +186,15 @@ class DeepSpatial:
             alpha_spatial=alpha_spatial,
             uot_reg=uot_reg,
             uot_tau=uot_tau,
-            mode=mode
+            uot_solver=uot_solver,
+            uot_top_k=uot_top_k,
+            uot_bidirectional=uot_bidirectional,
+            uot_candidate_radius=uot_candidate_radius,
+            mode=mode, use_celltype=use_celltype, histology_runtime=self.histology_runtime
         )
 
-        self.categories = pd.Index(self.dataset.label_encoder.classes_) 
+        self.categories = pd.Index(self.dataset.label_encoder.classes_)
+        if not len(self.dataset): raise ValueError('No UOT pairs sampled; inspect coupling or increase n_samples_base')
         self.train_loader = DataLoader(
             self.dataset, batch_size=batch_size, 
             shuffle=True, num_workers=num_workers
@@ -185,7 +247,6 @@ class DeepSpatial:
             "num_heads": num_heads,
             "mlp_ratio": mlp_ratio
         }
-        
         self.train_config = {
             "path_type": path_type,
             "prediction": "velocity",
@@ -200,6 +261,7 @@ class DeepSpatial:
             "atol": atol,
             "rtol": rtol
         }
+        self.train_config['use_celltype']=self.use_celltype
 
         self.model = GiT(
             gene_dim=self.gene_dim,
@@ -207,21 +269,27 @@ class DeepSpatial:
             **self.model_config
         )
 
-        self.module = DeepSpatialModule(self.train_config, self.model)
+        self.module = DeepSpatialModule(self.train_config, self.model, self.histology_runtime)
 
     def _save_config(self, save_dir: str):
         """Internal helper to persist metadata and configurations."""
         os.makedirs(save_dir, exist_ok=True)
         config = {
             'gene_dim': self.gene_dim,
+            'gene_names': self.gene_names,
             'num_classes': self.num_classes,
             'spatial_stats': self.spatial_stats,
             'categories': self.categories.tolist() if self.categories is not None else None,
             'spatial_key': self.spatial_key,
             'z_key': self.z_key,
             'label_key': self.label_key,
+            'propagated_label_keys': list(self.propagated_label_keys),
             'model_config': self.model_config,
-            'train_config': self.train_config
+            'train_config': self.train_config,
+            'use_celltype': self.use_celltype,
+            'uot_config': self.uot_config,
+            'histology_config': self.histology_config.to_dict() if self.histology_config else None,
+            'feature_revision': self.histology_runtime.store.revision if self.histology_runtime else None
         }
         with open(os.path.join(save_dir, 'config.json'), 'w') as f:
             json.dump(config, f)
@@ -245,22 +313,42 @@ class DeepSpatial:
             with open(config_path, 'r') as f:
                 config = json.load(f)
             self.gene_dim = config['gene_dim']
+            self.gene_names = config.get('gene_names')
             self.num_classes = config['num_classes']
             self.spatial_stats = config['spatial_stats']
             self.spatial_key = config.get('spatial_key', 'spatial')
             self.z_key = config.get('z_key', 'z_coord')
             self.label_key = config['label_key']
+            self.propagated_label_keys = tuple(
+                config.get('propagated_label_keys', ())
+            )
             self.categories = pd.Index(config['categories'])
+            self.uot_config = config.get('uot_config', {
+                'solver': 'dense',
+                'top_k': None,
+                'bidirectional': True,
+                'candidate_radius': None,
+            })
             self.model_config = config.get('model_config', {})
             self.train_config = config.get('train_config', {})
+            self.use_celltype=config.get('use_celltype',True)
+            from .histology.config import HistologyConfig
+            self.histology_config=HistologyConfig(**(config.get('histology_config') or {}))
+            self.histology_runtime=None
+            if self.histology_config.use_histology:
+                from .histology.runtime import HistologyRuntime
+                self.histology_runtime=HistologyRuntime(self.histology_config,self.spatial_stats)
+                if config.get('feature_revision')!=self.histology_runtime.store.revision:
+                    raise ValueError('Feature cache changed since checkpoint; use the training feature revision')
         else:
              raise ValueError("Metadata 'config.json' not found. Cannot rebuild model.")
 
-        if self.module is None:
-            self.train_config['sampling_method'] = sampling_method
-            self.build_model(**self.model_config, **self.train_config)
+        self.train_config['sampling_method'] = sampling_method
+        # Rebuild directly: train_config contains keys not accepted by build_model.
+        self.model=GiT(gene_dim=self.gene_dim,num_classes=self.num_classes,**self.model_config)
+        self.module=DeepSpatialModule(self.train_config,self.model,self.histology_runtime)
             
-        checkpoint = torch.load(ckpt_path, map_location=torch.device('cpu'))
+        checkpoint = torch.load(ckpt_path, map_location=torch.device('cpu'), weights_only=True)
         state_dict = checkpoint.get('state_dict', checkpoint)
         self.module.load_state_dict(state_dict)
 
@@ -327,7 +415,8 @@ class DeepSpatial:
                                    thickness: float,
                                    steps: int = 20, 
                                    chunk_size: int = 2048,
-                                   device: str = "auto") -> ad.AnnData:
+                                   device: str = "auto",
+                                   cache_celltype_trajectory: bool = False) -> ad.AnnData:
         """
         Generates a 3D volume segment between two specific AnnData slices.
 
@@ -342,6 +431,12 @@ class DeepSpatial:
         Returns:
             An AnnData object containing the interpolated 3D segment in physical coordinates.
         """
+        if self.module is None or self.spatial_stats is None:
+            raise ValueError('Build or load a model before reconstruction')
+        if steps<2 or chunk_size<1: raise ValueError('steps>=2 and chunk_size>=1 required')
+        if cache_celltype_trajectory and not self.use_celltype:
+            raise ValueError('cache_celltype_trajectory requires use_celltype=True')
+        self._prepare_reconstruction_inputs(adata0,adata1)
         # Device management
         if device == "auto":
             dev = self.module.device if self.module.device.type != 'cpu' else \
@@ -362,7 +457,8 @@ class DeepSpatial:
         # Execute chunked ODE integration
         mix_data = self._generate_and_prune_optimized(
             x0, g0, c0, x1, g1, c1, z0, z1, steps, 
-            target_cells, total_cells, dev, chunk_size
+            target_cells, total_cells, dev, chunk_size,
+            cache_celltype_trajectory=cache_celltype_trajectory,
         )
 
         # Assemble and restore to physical coordinates
@@ -370,12 +466,191 @@ class DeepSpatial:
         return self._restore_3d_physical_coords(adata_segment)
 
     @torch.no_grad()
+    def predict_on_he_cells(
+        self,
+        he_cells: ad.AnnData,
+        adata0: ad.AnnData,
+        adata1: ad.AnnData,
+        steps: int = 20,
+        chunk_size: int = 512,
+        device: str = "auto",
+        trajectory_cache: dict | None = None,
+    ) -> ad.AnnData:
+        """Predict one molecular state for every supplied H&E cell.
+
+        The source anchor cells are integrated from ``adata0`` toward ``adata1``.
+        For each H&E query plane, every query coordinate is assigned the nearest
+        propagated source trajectory in registered physical XY.  The returned
+        AnnData keeps the H&E coordinates as its spatial coordinates and stores
+        the propagated coordinate and nearest-neighbour distance for QC.
+
+        This is a cell-level inference interface, not a one-to-one lineage
+        tracker: several H&E cells may use the same nearby propagated anchor
+        trajectory.  ``chunk_size`` controls ODE memory usage only.  When
+        ``trajectory_cache`` is supplied, the continuous cell-type trajectory
+        selected for each H&E query cell is stored during this same ODE pass;
+        callers can materialize labels later without integrating again.
+        """
+        if self.module is None or self.spatial_stats is None:
+            raise ValueError("Build or load a model before H&E-cell prediction")
+        if steps < 2 or chunk_size < 1:
+            raise ValueError("steps>=2 and chunk_size>=1 required")
+        if self.spatial_key not in he_cells.obsm:
+            raise KeyError(f"H&E cells must contain obsm[{self.spatial_key!r}]")
+        if self.z_key not in he_cells.obs:
+            raise KeyError(f"H&E cells must contain obs[{self.z_key!r}]")
+        if not adata0.n_obs or not adata1.n_obs:
+            raise ValueError("Both anchor slices must be nonempty")
+        if trajectory_cache is not None:
+            trajectory_cache.clear()
+            trajectory_cache.update({"version": 1, "steps": int(steps), "planes": {}})
+
+        self._prepare_reconstruction_inputs(adata0, adata1)
+        query_xy = np.asarray(he_cells.obsm[self.spatial_key], dtype=np.float64)
+        query_z = np.asarray(he_cells.obs[self.z_key], dtype=np.float64)
+        if query_xy.shape != (he_cells.n_obs, 2) or not np.isfinite(query_xy).all():
+            raise ValueError("H&E cells must provide finite physical XY coordinates [N,2]")
+        if query_z.shape != (he_cells.n_obs,) or not np.isfinite(query_z).all():
+            raise ValueError("H&E cells must provide finite physical Z coordinates")
+
+        z0_phys = float(adata0.obs[self.z_key].iloc[0])
+        z1_phys = float(adata1.obs[self.z_key].iloc[0])
+        if z1_phys <= z0_phys:
+            raise ValueError("Anchor slices must have increasing physical Z")
+        if (query_z < z0_phys - 1e-6).any() or (query_z > z1_phys + 1e-6).any():
+            raise ValueError("H&E query Z coordinates must lie between the two anchors")
+
+        if device == "auto":
+            dev = self.module.device if self.module.device.type != "cpu" else torch.device(
+                "cuda" if torch.cuda.is_available() else "cpu"
+            )
+        else:
+            dev = torch.device(device)
+        if self.module.device != dev:
+            self.module.to(dev)
+        self.module.eval()
+
+        def extract_anchor(adata):
+            x = torch.tensor(adata.obsm["spatial_norm"], dtype=torch.float32, device=dev)
+            g_arr = adata.X.toarray() if scipy.sparse.issparse(adata.X) else np.asarray(adata.X)
+            g = torch.tensor(g_arr, dtype=torch.float32, device=dev)
+            if self.use_celltype and self.label_key in adata.obs:
+                codes = pd.Categorical(
+                    adata.obs[self.label_key], categories=self.categories
+                ).codes.astype(np.int64)
+                if (codes < 0).any():
+                    raise ValueError("Unknown/missing source cell type at H&E prediction")
+                c = torch.nn.functional.one_hot(
+                    torch.tensor(codes, dtype=torch.long, device=dev),
+                    num_classes=self.num_classes,
+                ).float()
+            else:
+                c = torch.zeros((adata.n_obs, self.num_classes), dtype=torch.float32, device=dev)
+            return x, g, c
+
+        x0, g0, c0 = extract_anchor(adata0)
+        z0_norm = float(adata0.obs["z_norm"].iloc[0])
+        z1_norm = float(adata1.obs["z_norm"].iloc[0])
+        delta_z = z1_norm - z0_norm
+        scale = np.array(
+            [self.spatial_stats["x_range"], self.spatial_stats["y_range"]],
+            dtype=np.float64,
+        )
+        origin = np.array(
+            [self.spatial_stats["x_min"], self.spatial_stats["y_min"]],
+            dtype=np.float64,
+        )
+
+        predicted_xy = np.empty_like(query_xy, dtype=np.float64)
+        assigned_xy = np.empty_like(query_xy, dtype=np.float64)
+        predicted_g = np.empty((he_cells.n_obs, g0.shape[1]), dtype=np.float32)
+        predicted_c = np.zeros(he_cells.n_obs, dtype=np.int64)
+        prediction_distance = np.empty(he_cells.n_obs, dtype=np.float32)
+
+        # H&E sections are normally represented by repeated z values. Process
+        # one plane at a time so the propagated gene matrix is not retained for
+        # the whole volume.
+        for z_phys in np.unique(query_z):
+            query_ids = np.flatnonzero(np.isclose(query_z, z_phys, rtol=0, atol=1e-6))
+            t_value = float((z_phys - z0_phys) / (z1_phys - z0_phys))
+            propagated_xy = []
+            propagated_g = []
+            propagated_c = []
+            propagated_c_cont = []
+            for start in range(0, x0.shape[0], chunk_size):
+                stop = min(start + chunk_size, x0.shape[0])
+                batch = {
+                    "x0": x0[start:stop],
+                    "g0": g0[start:stop],
+                    "c0": c0[start:stop],
+                    "z0": torch.full((stop - start, 1), z0_norm, device=dev),
+                    "z1": torch.full((stop - start, 1), z1_norm, device=dev),
+                    "delta_z": torch.full((stop - start, 1), delta_z, device=dev),
+                }
+                if t_value <= 1e-8:
+                    x_t = batch["x0"]
+                    g_t = batch["g0"]
+                    c_t = torch.argmax(batch["c0"], dim=-1)
+                    c_traj = batch["c0"].unsqueeze(0).expand(steps, -1, -1)
+                else:
+                    result = self.module.sample(batch, mode="ODE", steps=steps)
+                    scaled_t = t_value * (steps - 1)
+                    low = min(int(np.floor(scaled_t)), steps - 1)
+                    high = min(low + 1, steps - 1)
+                    weight = float(scaled_t - low)
+                    x_t = (1 - weight) * result["x_traj"][low] + weight * result["x_traj"][high]
+                    g_t = (1 - weight) * result["g_traj"][low] + weight * result["g_traj"][high]
+                    c_index = min(int(np.round(scaled_t)), steps - 1)
+                    c_t = result["c_traj_discrete"][c_index]
+                    c_traj = result["c_traj_cont"]
+                    del result
+                propagated_xy.append((x_t.detach().cpu().numpy() * scale) + origin)
+                propagated_g.append(torch.clamp(g_t, min=0).detach().cpu().numpy().astype(np.float32))
+                propagated_c.append(c_t.detach().cpu().numpy().astype(np.int64))
+                propagated_c_cont.append(c_traj.detach().cpu().numpy().astype(np.float32))
+
+            propagated_xy = np.concatenate(propagated_xy, axis=0)
+            propagated_g = np.concatenate(propagated_g, axis=0)
+            propagated_c = np.concatenate(propagated_c, axis=0)
+            propagated_c_cont = np.concatenate(propagated_c_cont, axis=1)
+            distances, nearest = cKDTree(propagated_xy).query(query_xy[query_ids], k=1)
+            predicted_xy[query_ids] = query_xy[query_ids]
+            assigned_xy[query_ids] = propagated_xy[nearest]
+            predicted_g[query_ids] = propagated_g[nearest]
+            predicted_c[query_ids] = propagated_c[nearest]
+            prediction_distance[query_ids] = distances.astype(np.float32)
+            if trajectory_cache is not None:
+                trajectory_cache["planes"][str(float(z_phys))] = {
+                    "z_um": float(z_phys),
+                    "t_values": np.full(len(query_ids), t_value, dtype=np.float32),
+                    "query_ids": query_ids.astype(np.int64),
+                    "source_indices": nearest.astype(np.int64),
+                    "c_traj_cont": propagated_c_cont[:, nearest, :].astype(np.float32, copy=False),
+                }
+
+        obs = he_cells.obs.copy()
+        obs["prediction_distance_um"] = prediction_distance
+        obs["prediction_source"] = "anchor0_forward_nearest"
+        if self.categories is not None:
+            obs[self.label_key] = pd.Categorical.from_codes(
+                predicted_c, categories=self.categories
+            )
+        result = ad.AnnData(
+            X=scipy.sparse.csr_matrix(predicted_g),
+            obs=obs,
+            var=adata0.var.copy(),
+            obsm={self.spatial_key: predicted_xy, "spatial_flow": assigned_xy},
+        )
+        return result
+
+    @torch.no_grad()
     def reconstruct_full_volume(self, 
                                 adata_list: list,
                                 thickness: float, 
                                 steps: int = 100, 
                                 chunk_size: int = 2048,
-                                device: str = "auto") -> ad.AnnData:
+                                device: str = "auto",
+                                cache_celltype_trajectory: bool = False) -> ad.AnnData:
         """
         High-level API to reconstruct the entire 3D volume from a list of slices.
 
@@ -415,7 +690,8 @@ class DeepSpatial:
                 steps=steps,
                 thickness=thickness,
                 chunk_size=chunk_size,
-                device=device
+                device=device,
+                cache_celltype_trajectory=cache_celltype_trajectory,
             )
             
             segment_list.append(segment)
@@ -426,6 +702,13 @@ class DeepSpatial:
         # Inherit metadata from the reference slice
         if hasattr(adata_list[0], 'uns'):
             full_volume.uns.update(adata_list[0].uns)
+        if cache_celltype_trajectory:
+            full_volume.uns['deepspatial_celltype_trajectory_cache'] = {
+                'enabled': True,
+                'storage': "obsm['celltype_flow_state']",
+                'semantics': 'continuous cell-type state at sampled virtual Z',
+                'one_pass_ode': True,
+            }
         
         return full_volume
 
@@ -433,8 +716,103 @@ class DeepSpatial:
     # Internal Computation Helpers
     # =========================================================================
 
+    def _prepare_reconstruction_inputs(self, adata0, adata1):
+        """Fresh H5AD inputs use TRAINING coordinate statistics, never refit them."""
+        self._resolve_propagated_label_keys(adata0, adata1)
+        if not adata0.var_names.equals(adata1.var_names):
+            raise ValueError('Reconstruction gene identities/order must agree')
+        stats=self.spatial_stats
+        zs=[]
+        for a in (adata0,adata1):
+            if not a.n_obs or a.n_vars!=self.gene_dim:
+                raise ValueError('Nonempty anchors with training gene dimension required')
+            if self.gene_names is not None and a.var_names.tolist()!=self.gene_names:
+                raise ValueError('Reconstruction gene order differs from training checkpoint')
+            xy=np.asarray(a.obsm[self.spatial_key])
+            z=np.asarray(a.obs[self.z_key],dtype=float)
+            if xy.shape!=(a.n_obs,2) or not np.isfinite(xy).all() or not np.isfinite(z).all() or not np.all(z==z[0]):
+                raise ValueError('Finite XY [N,2] and one physical Z per anchor required')
+            if self.use_celltype and (self.label_key not in a.obs or a.obs[self.label_key].isna().any()):
+                raise ValueError('Missing reconstruction labels; use a model trained with use_celltype=False')
+            coords=xy.copy()
+            if not np.issubdtype(coords.dtype,np.floating): coords=coords.astype(float)
+            coords[:,0]=(coords[:,0]-stats['x_min'])/stats['x_range']
+            coords[:,1]=(coords[:,1]-stats['y_min'])/stats['y_range']
+            a.obsm['spatial_norm']=coords
+            a.obs['z_norm']=(z[0]-stats['z_min'])/stats['z_range']
+            zs.append(z[0])
+            if self.histology_runtime: self.histology_runtime.section(a)
+        if self.histology_runtime and zs[1]<=zs[0]:
+            raise ValueError('Reconstruction anchors must have increasing physical Z')
+
+    def _resolve_propagated_label_keys_for_anchors(self, adata_list):
+        """Validate metadata labels shared by all training anchors.
+
+        The model only predicts ``cell_class``.  ``pred_domain`` and
+        ``pred_niche`` are carried as metadata, so silently training with
+        only a subset of anchors carrying them would create incomplete
+        reconstruction outputs later.
+        """
+
+        present_any = {
+            key: any(key in adata.obs for adata in adata_list)
+            for key in DEFAULT_PROPAGATED_LABEL_KEYS
+        }
+        incomplete = [
+            key
+            for key, seen in present_any.items()
+            if seen and not all(key in adata.obs for adata in adata_list)
+        ]
+        if incomplete:
+            raise ValueError(
+                "Propagated labels must be present on every anchor: "
+                + ", ".join(incomplete)
+            )
+
+        self.propagated_label_keys = tuple(
+            key for key in DEFAULT_PROPAGATED_LABEL_KEYS if present_any[key]
+        )
+        for key in self.propagated_label_keys:
+            if any(adata.obs[key].isna().any() for adata in adata_list):
+                raise ValueError(f"Missing values in propagated label {key!r}")
+        return self.propagated_label_keys
+
+    def _resolve_propagated_label_keys(self, adata0, adata1):
+        """Resolve and validate metadata labels for one reconstruction gap."""
+
+        if self.propagated_label_keys:
+            keys = tuple(self.propagated_label_keys)
+        else:
+            present_any = {
+                key: key in adata0.obs or key in adata1.obs
+                for key in DEFAULT_PROPAGATED_LABEL_KEYS
+            }
+            incomplete = [
+                key
+                for key, seen in present_any.items()
+                if seen and not (key in adata0.obs and key in adata1.obs)
+            ]
+            if incomplete:
+                raise ValueError(
+                    "Propagated labels must be present on both reconstruction "
+                    "anchors: " + ", ".join(incomplete)
+                )
+            keys = tuple(key for key in DEFAULT_PROPAGATED_LABEL_KEYS if present_any[key])
+
+        for key in keys:
+            for anchor_name, anchor in (("adata0", adata0), ("adata1", adata1)):
+                if key not in anchor.obs:
+                    raise ValueError(f"{anchor_name} is missing propagated label {key!r}")
+                if anchor.obs[key].isna().any():
+                    raise ValueError(
+                        f"{anchor_name} contains missing values in propagated label {key!r}"
+                    )
+        self.propagated_label_keys = keys
+        return keys
+
     def _setup_and_extract(self, adata0, adata1, thickness, dev):
         """Calculates sampling density and maps normalized input to device."""
+        if not np.isfinite(thickness) or thickness<=0: raise ValueError('thickness must be positive')
         avg_n_ref = (adata0.n_obs + adata1.n_obs) / 2
 
         z0, z1 = adata0.obs[self.z_key].iloc[0], adata1.obs[self.z_key].iloc[0]
@@ -449,7 +827,12 @@ class DeepSpatial:
             z = adata.obs['z_norm'].iloc[0]
             g_arr = adata.X.toarray() if scipy.sparse.issparse(adata.X) else adata.X
             g = torch.tensor(g_arr, dtype=torch.float32, device=dev)
-            c_idx = torch.tensor(pd.Categorical(adata.obs[self.label_key], categories=self.categories).codes.astype(np.int64), device=dev)
+            if self.use_celltype and self.label_key in adata.obs:
+                codes=pd.Categorical(adata.obs[self.label_key],categories=self.categories).codes.astype(np.int64)
+                if (codes<0).any(): raise ValueError('Unknown/missing cell type at reconstruction')
+                c_idx=torch.tensor(codes,device=dev)
+            else:
+                c_idx=torch.zeros(adata.n_obs,device=dev,dtype=torch.long)
             return x, z, g, c_idx
             
         x0, z0, g0, c0 = extract(adata0)
@@ -457,7 +840,23 @@ class DeepSpatial:
         
         return x0, z0, g0, c0, x1, z1, g1, c1, target_cells, total_cells
 
-    def _generate_and_prune_optimized(self, x0, g0, c0, x1, g1, c1, z0, z1, steps, target_cells, total_cells, dev, chunk_size):
+    def _generate_and_prune_optimized(
+        self,
+        x0,
+        g0,
+        c0,
+        x1,
+        g1,
+        c1,
+        z0,
+        z1,
+        steps,
+        target_cells,
+        total_cells,
+        dev,
+        chunk_size,
+        cache_celltype_trajectory=False,
+    ):
         """Memory-efficient ODE integration and spatial density pruning."""
         N0, N1 = float(x0.shape[0]), float(x1.shape[0])
         u = torch.rand(total_cells, device=dev)
@@ -478,11 +877,17 @@ class DeepSpatial:
         final_x = torch.zeros((total_cells, 2), device=dev)
         final_g = torch.zeros((total_cells, g0.shape[1]), device=dev)
         final_c = torch.zeros(total_cells, device=dev, dtype=torch.long)
+        final_c_cont = (
+            torch.zeros((total_cells, self.num_classes), device=dev)
+            if cache_celltype_trajectory
+            else None
+        )
 
         def process_direction(is_forward, src_indices, child_ids, x_ref, g_ref, c_ref, z_start, z_end):
             if len(child_ids) == 0: return
             unique_parents, inverse_indices = torch.unique(src_indices, return_inverse=True)
             c_onehot_ref = torch.nn.functional.one_hot(c_ref, num_classes=self.num_classes).float()
+            if not self.use_celltype: c_onehot_ref.zero_()
 
             for i in range(0, len(unique_parents), chunk_size):
                 end_idx = min(i + chunk_size, len(unique_parents))
@@ -498,11 +903,13 @@ class DeepSpatial:
                     'z1': torch.full((len(chunk_parents), 1), z_end, device=dev),
                     'delta_z': torch.full((len(chunk_parents), 1), z_end - z_start, device=dev)
                 }
+                if self.histology_runtime: batch['reverse']=not is_forward
                 res = self.module.sample(batch, mode="ODE", steps=steps)
                 
                 if not is_forward:
                     res['x_traj'] = torch.flip(res['x_traj'], dims=[0])
                     res['g_traj'] = torch.flip(res['g_traj'], dims=[0])
+                    res['c_traj_cont'] = torch.flip(res['c_traj_cont'], dims=[0])
                     res['c_traj_discrete'] = torch.flip(res['c_traj_discrete'], dims=[0])
 
                 chunk_t_vals = t_vals[chunk_child_ids] * (steps - 1)
@@ -513,6 +920,10 @@ class DeepSpatial:
                 final_x[chunk_child_ids] = (1 - w_high) * res['x_traj'][idx_low, local_parent_idx] + w_high * res['x_traj'][idx_high, local_parent_idx]
                 final_g[chunk_child_ids] = (1 - w_high) * res['g_traj'][idx_low, local_parent_idx] + w_high * res['g_traj'][idx_high, local_parent_idx]
                 final_c[chunk_child_ids] = res['c_traj_discrete'][torch.clamp(chunk_t_vals.round().long(), max=steps-1), local_parent_idx]
+                if final_c_cont is not None:
+                    c_low = res['c_traj_cont'][idx_low, local_parent_idx]
+                    c_high = res['c_traj_cont'][idx_high, local_parent_idx]
+                    final_c_cont[chunk_child_ids] = (1 - w_high) * c_low + w_high * c_high
 
                 del res, batch
                 torch.cuda.empty_cache()
@@ -542,12 +953,15 @@ class DeepSpatial:
                 g_chunk[~final_mask] = 0.0
                 final_g[i:end_idx] = g_chunk
         
-        return {
+        result = {
             'x': final_x.cpu().numpy(), 'g': final_g, 'c': final_c.cpu().numpy(), 
             'zs': target_zs.cpu().numpy(), 'cells': target_cells,
             'fwd_src': fwd_src_keep.cpu().numpy(), 'bwd_src': bwd_src_keep.cpu().numpy(),
             'fwd_idx': fwd_keep_indices.cpu().numpy(), 'bwd_idx': bwd_keep_indices.cpu().numpy()
         }
+        if final_c_cont is not None:
+            result['c_cont'] = final_c_cont.cpu().numpy()
+        return result
 
     def _assemble_fast_anndata(self, adata0, adata1, mix_data):
         """Constructs the resulting AnnData with sparse expression matrix."""
@@ -567,11 +981,27 @@ class DeepSpatial:
         mixed_obs[self.z_key] = mix_data['zs'] 
         mixed_obs[self.label_key] = pd.Categorical.from_codes(mix_data['c'], categories=self.categories)
 
+        # Explicitly validate branch-inherited metadata after concatenation.
+        # The row indices are the generated-cell indices, so forward rows are
+        # inherited from adata0 and backward rows from adata1 without any
+        # reordering ambiguity.
+        for key in self.propagated_label_keys:
+            if key not in mixed_obs.columns:
+                raise RuntimeError(f"Reconstruction lost propagated label {key!r}")
+            if mixed_obs[key].isna().any():
+                raise RuntimeError(
+                    f"Reconstruction produced missing propagated label values in {key!r}"
+                )
+
         mixed_obs.index = mixed_obs.index.astype(str)
+
+        obsm = {self.spatial_key: mix_data['x']}
+        if 'c_cont' in mix_data:
+            obsm['celltype_flow_state'] = np.asarray(mix_data['c_cont'], dtype=np.float32)
 
         return ad.AnnData(
             X=res_g_sparse, 
             obs=mixed_obs, 
             var=adata0.var.copy(), 
-            obsm={self.spatial_key: mix_data['x']}
+            obsm=obsm,
         )

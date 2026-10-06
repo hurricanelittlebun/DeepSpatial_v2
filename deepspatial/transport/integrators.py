@@ -86,6 +86,7 @@ class ode:
         num_steps,
         atol,
         rtol,
+        options=None,
     ):
         assert t0 < t1, "ODE sampler has to be in forward time"
 
@@ -94,6 +95,7 @@ class ode:
         self.atol = atol
         self.rtol = rtol
         self.sampler_type = sampler_type
+        self.options=options
 
     def sample(self, x, model, **model_kwargs):
         
@@ -112,6 +114,7 @@ class ode:
             t,
             method=self.sampler_type,
             atol=atol,
-            rtol=rtol
+            rtol=rtol,
+            options=self.options
         )
         return samples

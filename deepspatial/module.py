@@ -19,7 +19,7 @@ class DeepSpatialModule(pl.LightningModule):
         The core neural network architecture (e.g., the GiT model) that predicts 
         the velocity fields.
     """
-    def __init__(self, args, model):
+    def __init__(self, args, model, histology_runtime=None):
         """
         Initializes an LightningModule instance for DeepSpatial.
         """
@@ -28,6 +28,9 @@ class DeepSpatialModule(pl.LightningModule):
         
         # Core Model
         self.model = model
+        self.histology=histology_runtime
+        if self.histology and (self.hparams.path_type!='Linear' or self.hparams.prediction!='velocity'):
+            raise ValueError('Histology mode currently supports Linear molecular/cell paths and velocity prediction only')
         
         # EMA Setup
         self.ema_decay = self.hparams.get('ema_decay', 0.999)
@@ -75,6 +78,8 @@ class DeepSpatialModule(pl.LightningModule):
 
         # Plan paths (interpolation)
         _, xt, ux_t = self.transport.path_sampler.plan(t, x0, x1)
+        if self.histology and self.histology.config.use_morphology_path:
+            xt,ux_t=self.histology.plan(batch['path_id'],t)
         _, gt, ug_t = self.transport.path_sampler.plan(t, g0, g1)
         _, ct, uc_t = self.transport.path_sampler.plan(t, c0, c1)
         _, zt, _ = self.transport.path_sampler.plan(t, z0, z1)
@@ -91,6 +96,7 @@ class DeepSpatialModule(pl.LightningModule):
         loss_g = self.transport.loss_fn(vg_pred, g0, gt, t, ug_t).mean()
         # Cell type loss (on one-hot/continuous space)
         loss_c = self.transport.loss_fn(vc_pred, c0, ct, t, uc_t).mean()
+        if not self.hparams.get('use_celltype',True): loss_c=loss_c*0
 
         # Weighted total loss
         lambda_g = self.hparams.get('lambda_g', 0.1)
@@ -160,6 +166,9 @@ class DeepSpatialModule(pl.LightningModule):
         """
 
         self.ema_model.eval()
+        if self.histology and mode!='ODE':
+            raise ValueError('Morphology-guided paths support ODE sampling, not linear-path SDE score conversion')
+        if steps<2: raise ValueError('steps must be at least 2')
         
         # Configure the ODE/SDE sampler based on hyperparameters
         sample_config = {
@@ -168,6 +177,10 @@ class DeepSpatialModule(pl.LightningModule):
             'atol': self.hparams.get('atol', 1e-5),
             'rtol': self.hparams.get('rtol', 1e-5)
         }
+        if self.histology and sample_config['sampling_method'] in ('dopri5','dopri8','bosh3','adaptive_heun','fehlberg2'):
+            # Force RK to land on the anchor boundary instead of probing well
+            # beyond valid histology in an accepted oversized internal step.
+            sample_config['options']={'step_t':[1.], 'first_step':.01}
         
         # Instantiate the integration function
         sampler_fn = self.sampler.sample_ode(**sample_config) if mode == "ODE" else self.sampler.sample_sde(**sample_config)
@@ -195,12 +208,24 @@ class DeepSpatialModule(pl.LightningModule):
             t_tensor = torch.full((xt.shape[0],), t_val, device=xt.device, dtype=xt.dtype)
 
             # Interpolate normalized Z coordinate
-            _, zt, _ = self.transport.path_sampler.plan(t_tensor, z0, z1)
+            # Adaptive RK stages can overshoot t=1 before dense interpolation.
+            # Extend histology conditioning by its boundary plane for those
+            # internal stages; requested output times remain exactly in [0,1].
+            condition_t=t_tensor.clamp(0,1) if self.histology else t_tensor
+            _, zt, _ = self.transport.path_sampler.plan(condition_t, z0, z1)
+            # Training pairs run low-Z -> high-Z. Reverse integration evaluates
+            # that SAME field at 1-t with positive anchor gap, and negates dx/dt.
+            reverse=batch.get('reverse',False) and self.histology is not None
+            model_t=1-t_tensor if reverse else t_tensor
+            model_gap=-delta_z if reverse else delta_z
+            if not self.hparams.get('use_celltype',True): ct=torch.zeros_like(ct)
 
             # Forward pass through EMA model
             vx, vg, vc = self.ema_model(
-                xt=xt, gt=gt, t=t_tensor, zt=zt, delta_z=delta_z, ct=ct
+                xt=xt, gt=gt, t=model_t, zt=zt, delta_z=model_gap, ct=ct
             )
+            if not self.hparams.get('use_celltype',True): vc=torch.zeros_like(vc)
+            if reverse: vx,vg,vc=-vx,-vg,-vc
             return torch.cat([vx, vg, vc], dim=-1)
 
         # Compute trajectory: Shape [steps, batch, dim]
@@ -216,5 +241,6 @@ class DeepSpatialModule(pl.LightningModule):
         return {
             'x_traj': x_traj,
             'g_traj': g_traj,
+            'c_traj_cont': c_traj_cont,
             'c_traj_discrete': torch.argmax(c_traj_cont, dim=-1)
         }

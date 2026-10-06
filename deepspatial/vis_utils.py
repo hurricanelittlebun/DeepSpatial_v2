@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Optional, Union, Dict, List, Tuple
 
 import numpy as np
@@ -10,8 +12,16 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import plotly.express as px
 import plotly.graph_objects as go
-import ipywidgets as widgets
-from IPython.display import display
+
+try:
+    import ipywidgets as widgets
+except ImportError:  # Optional dependency used only by the range widget below.
+    widgets = None
+
+try:
+    from IPython.display import display
+except ImportError:  # Optional dependency used only for displaying the widget.
+    display = None
 
 
 # ==============================================================================
@@ -798,6 +808,17 @@ def interactive_spatial_range_widget(
     ipywidgets.VBox or None
         Container widget if `show=False`, else None.
     """
+    if widgets is None:
+        raise ImportError(
+            "interactive_spatial_range_widget requires ipywidgets; "
+            "install it to use the Jupyter range widget."
+        )
+    if show and display is None:
+        raise ImportError(
+            "interactive_spatial_range_widget requires IPython when show=True; "
+            "install it to display the Jupyter widget."
+        )
+
     df, _ = _extract_coords(adata, spatial_key, z_key, max_points=None)
     df['label'] = adata.obs[color_col].astype(str).values
     categories = np.unique(df['label'])
